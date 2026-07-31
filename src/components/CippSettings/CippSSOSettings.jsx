@@ -1,5 +1,8 @@
 import { useEffect } from "react";
 import {
+  Accordion,
+  AccordionDetails,
+  AccordionSummary,
   Alert,
   Button,
   CardActions,
@@ -10,6 +13,7 @@ import {
   Stack,
   Typography,
 } from "@mui/material";
+import { ExpandMore } from "@mui/icons-material";
 import { useForm } from "react-hook-form";
 import { Grid } from "@mui/system";
 import CippFormComponent from "../CippComponents/CippFormComponent";
@@ -34,6 +38,13 @@ export const CippSSOSettings = () => {
     defaultValues: { multiTenant: false },
   });
 
+  // Separate form for the manual-configuration section so its fields don't
+  // interfere with the automated flow's multiTenant switch.
+  const manualFormControl = useForm({
+    mode: "onChange",
+    defaultValues: { appId: "", appSecret: "", multiTenant: false },
+  });
+
   const ssoStatus = ApiGetCall({
     url: "/api/ExecSSOSetup",
     data: { Action: "Status" },
@@ -48,6 +59,13 @@ export const CippSSOSettings = () => {
     if (ssoStatus.isSuccess && ssoStatus.data?.Results) {
       const data = ssoStatus.data.Results;
       formControl.reset({ multiTenant: data.multiTenant ?? false });
+      // Seed the manual section's multi-tenant switch and App ID with the current
+      // values; leave the secret blank so it's only written when the admin types one.
+      manualFormControl.reset({
+        appId: data.appId ?? "",
+        appSecret: "",
+        multiTenant: data.multiTenant ?? false,
+      });
     }
   }, [ssoStatus.isSuccess, ssoStatus.data]);
 
@@ -66,6 +84,15 @@ export const CippSSOSettings = () => {
   // (the original "Failed to create client secret after 5 attempts" bug).
   const showCreate = !isProvisioned && !canRepair;
   const isOrphanedError = statusKey === "error" && !hasAppId;
+  // Three states on purpose: warmup may not have attempted the grant yet, which is not the
+  // same as the tenant refusing it. Failure is a soft one — sign-in still works, users just
+  // see the consent prompt they see today.
+  const preconsentInfo =
+    data?.preconsented === true
+      ? { label: "Granted", color: "success" }
+      : data?.preconsented === false
+        ? { label: "Not Granted", color: "warning" }
+        : { label: "Not Checked", color: "default" };
 
   const handleCreate = () => {
     ssoAction.mutate({
@@ -136,6 +163,36 @@ export const CippSSOSettings = () => {
     });
   };
 
+  const handleManualSave = manualFormControl.handleSubmit((values) => {
+    if (
+      !window.confirm(
+        "This will overwrite the stored SSO Application ID and client secret in Key Vault. " +
+          "An incorrect App ID or secret will break single sign-on. Make sure the values are correct before continuing. Continue?"
+      )
+    ) {
+      return;
+    }
+    ssoAction.mutate(
+      {
+        url: "/api/ExecSSOSetup",
+        data: {
+          Action: "ManualConfigure",
+          appId: values.appId?.trim(),
+          appSecret: values.appSecret,
+          multiTenant: values.multiTenant,
+        },
+      },
+      {
+        onSuccess: () => {
+          // Clear the secret field so it isn't left sitting in the form. On a CIPP-NG
+          // instance the returned message tells the user to restart to apply the change;
+          // the restart itself is done from the container-management page.
+          manualFormControl.setValue("appSecret", "");
+        },
+      }
+    );
+  });
+
   return (
     <CippButtonCard title="SSO App Registration" isFetching={ssoStatus.isFetching}>
       <CardContent>
@@ -155,6 +212,34 @@ export const CippSSOSettings = () => {
               <Grid size={{ xs: 8 }}>
                 <Chip label={statusInfo.label} color={statusInfo.color} size="small" />
               </Grid>
+
+              {hasAppId && (
+                <>
+                  <Grid size={{ xs: 4 }}>
+                    <Typography variant="body2" color="text.secondary">
+                      Admin Consent
+                    </Typography>
+                  </Grid>
+                  <Grid size={{ xs: 8 }}>
+                    <Chip
+                      label={preconsentInfo.label}
+                      color={preconsentInfo.color}
+                      size="small"
+                    />
+                    {data?.preconsented === false && (
+                      <Typography
+                        variant="caption"
+                        color="text.secondary"
+                        sx={{ display: "block", mt: 0.5 }}
+                      >
+                        {data?.preconsentError
+                          ? `Users will be prompted to consent at sign-in. ${data.preconsentError}`
+                          : "Users will be prompted to consent at sign-in."}
+                      </Typography>
+                    )}
+                  </Grid>
+                </>
+              )}
 
               {data?.appId && (
                 <>
@@ -233,6 +318,65 @@ export const CippSSOSettings = () => {
             />
 
             <CippApiResults apiObject={ssoAction} />
+
+            <Accordion disableGutters elevation={0} sx={{ "&:before": { display: "none" } }}>
+              <AccordionSummary expandIcon={<ExpandMore />} sx={{ px: 0 }}>
+                <Typography variant="body2" sx={{ fontWeight: 600 }}>
+                  Manual configuration (advanced)
+                </Typography>
+              </AccordionSummary>
+              <AccordionDetails sx={{ px: 0 }}>
+                <Stack spacing={2}>
+                  <Alert severity="info">
+                    Enter an existing Application (client) ID and client secret to store them directly
+                    in Key Vault — for example to rotate the secret by hand or point SSO at a different
+                    app registration. The instance must be restarted for the change to take effect.
+                  </Alert>
+
+                  <CippFormComponent
+                    type="textField"
+                    name="appId"
+                    label="Application (client) ID"
+                    formControl={manualFormControl}
+                    disableVariables
+                    validators={{
+                      required: "Application (client) ID is required",
+                      pattern: {
+                        value: /^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$/,
+                        message: "Must be a valid GUID",
+                      },
+                    }}
+                  />
+
+                  <CippFormComponent
+                    type="password"
+                    name="appSecret"
+                    label="Client secret"
+                    formControl={manualFormControl}
+                    autoComplete="new-password"
+                    validators={{ required: "Client secret is required" }}
+                  />
+
+                  <CippFormComponent
+                    type="switch"
+                    name="multiTenant"
+                    label="Multi-tenant mode (allow users from multiple Entra ID tenants)"
+                    formControl={manualFormControl}
+                  />
+
+                  <Stack direction="row" justifyContent="flex-end">
+                    <Button
+                      variant="contained"
+                      color="warning"
+                      onClick={handleManualSave}
+                      disabled={ssoAction.isPending}
+                    >
+                      Save Manual Configuration
+                    </Button>
+                  </Stack>
+                </Stack>
+              </AccordionDetails>
+            </Accordion>
           </Stack>
         )}
       </CardContent>
